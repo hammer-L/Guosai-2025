@@ -10,7 +10,7 @@ sns.set(style="whitegrid")
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-male_df = pd.read_excel("ref.xlsx", sheet_name="男胎检测数据")
+male_df = pd.read_excel("filref.xlsx", sheet_name="男胎检测数据")
 
 # ----------------
 # 数据预处理
