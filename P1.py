@@ -1,21 +1,20 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_curve, roc_auc_score
-from mpl_toolkits.mplot3d import Axes3D
 import seaborn as sns
+import statsmodels.api as sm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+from scipy.optimize import curve_fit
+from sklearn.linear_model import LinearRegression
 
 sns.set(style="whitegrid")
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-male_df = pd.read_excel("filref.xlsx", sheet_name="男胎检测数据")
+# ---------- 数据读取与预处理 ----------
+df = pd.read_excel("ref.xlsx", sheet_name="男胎检测数据")
 
-# ----------------
-# 数据预处理
-# ----------------
-# 处理孕周字符串，如 "11w+6" -> 11 + 6/7
 def parse_gestation(week_str):
     try:
         if isinstance(week_str, str) and "w" in week_str:
@@ -29,105 +28,213 @@ def parse_gestation(week_str):
         return None
     return None
 
-male_df["孕周数"] = male_df["检测孕周"].apply(parse_gestation)
-male_df["BMI"] = male_df["体重"] / ((male_df["身高"]/100) ** 2)
+df["孕周数"] = df["检测孕周"].apply(parse_gestation)
+df["BMI"] = df["孕妇BMI"]
+data = df[["孕周数","BMI","Y染色体浓度"]].dropna()
 
-# 保留关键字段
-male_clean = male_df[["孕周数","BMI","Y染色体浓度"]].dropna()
+# ---------- 数据集分层划分（按Y浓度区间比例） ----------
+num_bins = 5
+data = data.copy()
+data['FF_bin'] = pd.cut(data['Y染色体浓度'], bins=num_bins, labels=False)
 
-# ----------------
-# 构造分类变量：是否达标 (Y浓度 >= 4%)
-# ----------------
-male_clean["达标"] = (male_clean["Y染色体浓度"] >= 0.04).astype(int)
+train_data, test_data = train_test_split(
+    data,
+    test_size=0.3,
+    random_state=42,
+    stratify=data['FF_bin']
+)
 
-# 特征与标签
-X = male_clean[["孕周数", "BMI"]]
-y = male_clean["达标"]
+G_train, B_train, FF_train = train_data["孕周数"].values, train_data["BMI"].values, train_data["Y染色体浓度"].values
+G_test, B_test, FF_test = test_data["孕周数"].values, test_data["BMI"].values, test_data["Y染色体浓度"].values
+X_train_df, y_train_df = train_data[["孕周数", "BMI"]], train_data["Y染色体浓度"]
+X_test_df, y_test_df = test_data[["孕周数", "BMI"]], test_data["Y染色体浓度"]
 
-# ----------------
-# 逻辑回归建模
-# ----------------
-log_reg = LogisticRegression()
-log_reg.fit(X, y)
+# ===============================================================
+# 1. 非线性模型（仅测试集）
+# ===============================================================
+def FF_model(X, a, p, b, c):
+    G, B = X
+    A = a * G**p
+    M = b * np.exp(c*B)
+    return A / (A + M)
+popt, pcov = curve_fit(FF_model, (G_train,B_train), FF_train, bounds=(0, [np.inf,np.inf,np.inf,np.inf]))
+a,p,b,c = popt
+FF_pred_nl = FF_model((G_test, B_test), a, p, b, c)
+r2_nl = r2_score(FF_test, FF_pred_nl)
+mse_nl = mean_squared_error(FF_test, FF_pred_nl)
 
-# 预测概率
-y_pred_prob = log_reg.predict_proba(X)[:, 1]
-
-# ROC 曲线和 AUC
-fpr, tpr, thresholds = roc_curve(y, y_pred_prob)
-auc_score = roc_auc_score(y, y_pred_prob)
-
-# ----------------
-# 绘制 ROC 曲线
-# ----------------
-plt.figure(figsize=(6,6))
-plt.plot(fpr, tpr, label=f"Logistic回归 (AUC = {auc_score:.3f})")
-plt.plot([0,1], [0,1], linestyle="--", color="gray")
-plt.xlabel("假阳性率 (FPR)")
-plt.ylabel("真正率 (TPR)")
-plt.title("ROC曲线 - Y染色体浓度是否达标预测")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# ----------------
-# 输出模型系数
-# ----------------
-
-coef = pd.DataFrame({
-    "变量": ["孕周数","BMI"],
-    "系数": np.round(log_reg.coef_[0], 4)
+# ===============================================================
+# 2. C-logit 模型（仅测试集）
+# ===============================================================
+eps = 1e-6
+FF_clip_train = np.clip(FF_train, eps, 1-eps)
+logit_FF_train = np.log(FF_clip_train / (1-FF_clip_train))
+X_logit_train = pd.DataFrame({
+    "lnG": np.log(G_train),
+    "BMI": B_train
 })
-intercept = round(log_reg.intercept_[0], 4)
+X_logit_train = sm.add_constant(X_logit_train)
+model_logit = sm.OLS(logit_FF_train, X_logit_train).fit()
 
-print("模型系数：")
-print(coef)
-print("截距：", intercept)
+G_test_logit = G_test
+B_test_logit = B_test
+FF_test_logit = np.clip(FF_test, eps, 1-eps)
+X_test_logit = pd.DataFrame({
+    "lnG": np.log(G_test_logit),
+    "BMI": B_test_logit
+})
+X_test_logit = sm.add_constant(X_test_logit)
+logit_pred_test = model_logit.predict(X_test_logit)
+FF_pred_logit = 1 / (1 + np.exp(-logit_pred_test))
+r2_logit = r2_score(FF_test_logit, FF_pred_logit)
 
-# ----------------
-# 散点图 + 拟合曲线
-# ----------------
-plt.figure(figsize=(10,6))
+# ===============================================================
+# 3. 线性回归模型（仅测试集）
+# ===============================================================
+X_const_train = sm.add_constant(X_train_df)
+model_lin = sm.OLS(y_train_df, X_const_train).fit()
+X_test_const = sm.add_constant(X_test_df)
+y_pred_lin = model_lin.predict(X_test_const)
+r2_lin = r2_score(y_test_df, y_pred_lin)
 
-# 散点图：Y浓度 vs 孕周，颜色表示BMI
-scatter = plt.scatter(male_clean['孕周数'], male_clean['Y染色体浓度'],
-                      c=male_clean['BMI'], cmap='viridis', alpha=0.6)
-plt.axhline(y=0.04, color='red', linestyle='--', linewidth=1.5, label='Y浓度 = 4%')
-plt.colorbar(scatter, label='BMI')
-plt.xlabel('孕周数')
-plt.ylabel('Y染色体浓度')
-plt.title('Y染色体浓度 vs 孕周数 (按BMI显示)')
-plt.grid(True)
-plt.show()
+# ===============================================================
+# 4. 隐函数模型（仅测试集，可自定义项和自动权重数量）
+# ===============================================================
+# ---------- 通用隐函数特征构造器 ----------
+def implicit_feature_builder(x1, x2, y, terms):
+    feats = []
+    for term in terms:
+        if term == 'x1^2':
+            feats.append(x1**2)
+        elif term == 'x2^2':
+            feats.append(x2**2)
+        elif term == 'x1':
+            feats.append(x1)
+        elif term == 'x2':
+            feats.append(x2)
+        elif term == 'y':
+            feats.append(y)
+        elif term == '1':
+            feats.append(np.ones_like(x1))
+        elif term == '0.7^x2':
+            feats.append(0.7 ** x2)
+        elif term == '0.7^x1':
+            feats.append(0.7 ** x1)
+        elif term == '1/x1':
+            feats.append(1 / x1)
+        elif term == '1/x2':
+            feats.append(1 / x2)
 
-plt.figure(figsize=(10,6))
+        # 可继续扩展更多项，如 log(x1)、sin(x1) 等
+        else:
+            raise ValueError(f"未知项: {term}")
+    return np.column_stack(feats)
+# 可自由扩展项，权重数量自动适配
+#'x1', 'x1^2', 'x2^2', '07^x1', '07^x2'
+implicit_terms = [
+    'x1^2',
+    'x2^2',
+    'x1',
+    'y',
+    '1',
+    '0.7^x1',
+    '0.7^x2',
 
-# 散点图：Y浓度 vs BMI，颜色表示孕周
-scatter = plt.scatter(male_clean['BMI'], male_clean['Y染色体浓度'],
-                      c=male_clean['孕周数'], cmap='plasma', alpha=0.6)
-plt.axhline(y=0.04, color='red', linestyle='--', linewidth=1.5, label='Y浓度 = 4%')
-plt.colorbar(scatter, label='孕周数')
-plt.xlabel('BMI')
-plt.ylabel('Y染色体浓度')
-plt.title('Y染色体浓度 vs BMI (按孕周显示)')
-plt.grid(True)
-plt.show()
+]
 
-fig = plt.figure(figsize=(10,7))
-ax = fig.add_subplot(111, projection='3d')
+X_implicit = implicit_feature_builder(
+    X_train_df['孕周数'].values,
+    X_train_df['BMI'].values,
+    y_train_df.values,
+    implicit_terms
+)
+y_rhs = -y_train_df.values**2  # 右端项可自定义
 
-# 三维散点
-sc = ax.scatter(male_clean['BMI'], male_clean['孕周数'], male_clean['Y染色体浓度'],
-                c=male_clean['Y染色体浓度'], cmap='viridis', s=20, alpha=0.6)
+implicit_model = LinearRegression(fit_intercept=False)
+implicit_model.fit(X_implicit, y_rhs)
 
-# 添加颜色条
-cbar = plt.colorbar(sc, pad=0.1)
-cbar.set_label('Y染色体浓度')
+# 测试集预测
+x1_test = X_test_df['孕周数'].values
+x2_test = X_test_df['BMI'].values
+y_test = y_test_df.values
 
-# 添加坐标轴标签
-ax.set_xlabel('BMI')
-ax.set_ylabel('孕周数')
-ax.set_zlabel('Y染色体浓度')
-ax.set_title('BMI、孕周数与Y染色体浓度三维散点图')
+X_test_implicit = implicit_feature_builder(x1_test, x2_test, y_test, implicit_terms)
+coef_values = implicit_model.coef_
 
-plt.show()
+# 用字典自动映射每个项的权重
+term_dict = dict(zip(implicit_terms, coef_values))
+
+# 按隐函数关系解y（二次方程结构，可自由调整）
+a = np.ones_like(x1_test)
+b = term_dict.get('x1*y',0)*x1_test + term_dict.get('x2*y',0)*x2_test + term_dict.get('y',0)
+c = term_dict.get('x1^2',0)*x1_test**2 + term_dict.get('x2^2',0)*x2_test**2 \
+    + term_dict.get('x1*x2',0)*x1_test*x2_test + term_dict.get('x1',0)*x1_test \
+    + term_dict.get('x2',0)*x2_test + term_dict.get('1',0) \
+    + term_dict.get('exp(x1)',0)*np.exp(x1_test) \
+    + term_dict.get('exp(x2)',0)*np.exp(x2_test) \
+    + term_dict.get('exp(y)',0)*np.exp(y_test)
+
+discriminant = b**2 - 4*a*c
+discriminant[discriminant<0] = 0
+y_pred1 = (-b + np.sqrt(discriminant)) / (2*a)
+y_pred2 = (-b - np.sqrt(discriminant)) / (2*a)
+y_mean = y_train_df.mean()
+y_pred_impl = np.where(np.abs(y_pred1 - y_mean) < np.abs(y_pred2 - y_mean), y_pred1, y_pred2)
+r2_impl = r2_score(y_test_df, y_pred_impl)
+
+# ===============================================================
+# 四图合并显示（全部只用测试集）
+# ===============================================================
+def create_and_save_plot(ax, x_data, y_data, title, file_name):
+    """
+    绘制并保存单个预测 vs. 真实值的散点图。
+    """
+    ax.scatter(x_data, y_data, alpha=0.7)
+    # 绘制y=x对角线
+    ax.plot([x_data.min(), x_data.max()], [x_data.min(), x_data.max()], 'r--', lw=2)
+
+    ax.set_xlabel("真实 Y染色体浓度")
+    ax.set_ylabel("预测 Y染色体浓度")
+    ax.set_title(title)
+    ax.grid(True)
+
+    # 设置网格和样式
+    plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+    plt.gca().set_facecolor('#F8F9FA')
+
+    # 美化边框
+    for spine in plt.gca().spines.values():
+        spine.set_linewidth(1.5)
+        spine.set_color('#DDDDDD')
+
+    # 调整布局并保存图片
+    plt.tight_layout()
+    plt.savefig(file_name, dpi=300, bbox_inches='tight')
+    plt.close(ax.figure)  # 关闭图形以释放内存
+
+
+# 1. 线性回归
+fig_lin, ax_lin = plt.subplots(figsize=(8, 8))
+title_lin = f"线性回归\nR²={r2_lin:.3f}"
+file_name_lin = "linear_regression_plot.png"
+create_and_save_plot(ax_lin, y_test_df, y_pred_lin, title_lin, file_name_lin)
+
+# 2. C-logit
+fig_logit, ax_logit = plt.subplots(figsize=(8, 8))
+title_logit = f"FF稀释比例模型C-logit形式\nR²={r2_logit:.3f}"
+file_name_logit = "c_logit_plot.png"
+create_and_save_plot(ax_logit, FF_test_logit, FF_pred_logit, title_logit, file_name_logit)
+
+# 3. 非线性
+fig_nl, ax_nl = plt.subplots(figsize=(8, 8))
+title_nl = f"FF稀释比例模型\nR²={r2_nl:.3f}"
+file_name_nl = "nonlinear_model_plot.png"
+create_and_save_plot(ax_nl, FF_test, FF_pred_nl, title_nl, file_name_nl)
+
+# 4. 隐函数
+fig_impl, ax_impl = plt.subplots(figsize=(8, 8))
+title_impl = f"隐函数模型\nR²={r2_impl:.3f}"
+file_name_impl = "implicit_function_plot.png"
+create_and_save_plot(ax_impl, y_test_df, y_pred_impl, title_impl, file_name_impl)
+
+print("四张独立的模型预测 vs. 真实值图片已成功保存。")
